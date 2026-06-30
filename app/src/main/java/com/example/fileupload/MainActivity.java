@@ -1,5 +1,6 @@
 package com.example.fileupload;
 
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.net.Uri;
@@ -14,7 +15,15 @@ import android.widget.TextView;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.FileProvider;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.File;
+import java.io.FileOutputStream;
 
 import com.hierynomus.msdtyp.AccessMask;
 import com.hierynomus.mssmb2.SMB2CreateDisposition;
@@ -28,7 +37,11 @@ import com.hierynomus.smbj.share.DiskShare;
 
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.EnumSet;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -36,6 +49,10 @@ import java.util.concurrent.TimeUnit;
 public class MainActivity extends AppCompatActivity {
 
     private static final String PREFS = "smb_prefs";
+
+    /** GitHub Releases API for this repo; the CI workflow publishes the APK here. */
+    private static final String UPDATE_API =
+            "https://api.github.com/repos/AmsteinGraphics/apk-fileupload/releases/latest";
 
     private EditText hostField, shareField, pathField, userField, passField;
     private TextView selectedLabel, statusView;
@@ -78,6 +95,13 @@ public class MainActivity extends AppCompatActivity {
 
         Button upload = findViewById(R.id.upload);
         upload.setOnClickListener(v -> startUpload());
+
+        Button update = findViewById(R.id.update);
+        update.setOnClickListener(v -> checkForUpdate());
+
+        ((TextView) findViewById(R.id.version)).setText(
+                "Installed: " + BuildConfig.VERSION_NAME
+                        + " (build " + BuildConfig.VERSION_CODE + ")");
     }
 
     private void loadPrefs() {
@@ -229,6 +253,157 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // --- Self-update (OTA) from GitHub Releases ---
+
+    private void checkForUpdate() {
+        setBusy(true);
+        status("Checking for updates …");
+        executor.submit(() -> {
+            try {
+                HttpURLConnection conn = (HttpURLConnection) new URL(UPDATE_API).openConnection();
+                conn.setRequestProperty("Accept", "application/vnd.github+json");
+                conn.setRequestProperty("User-Agent", "fileupload-app");
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(15000);
+                int code = conn.getResponseCode();
+                if (code == 404) throw new Exception("no published release yet");
+                if (code != 200) throw new Exception("GitHub returned HTTP " + code);
+
+                String body;
+                try (InputStream in = conn.getInputStream()) {
+                    body = readAll(in);
+                } finally {
+                    conn.disconnect();
+                }
+
+                JSONObject json = new JSONObject(body);
+                final String tag = json.optString("tag_name", "");
+                final int remote = parseBuild(tag);
+
+                String apkUrl = null;
+                JSONArray assets = json.optJSONArray("assets");
+                if (assets != null) {
+                    for (int i = 0; i < assets.length(); i++) {
+                        JSONObject a = assets.getJSONObject(i);
+                        if (a.optString("name", "").toLowerCase(Locale.US).endsWith(".apk")) {
+                            apkUrl = a.optString("browser_download_url", null);
+                            break;
+                        }
+                    }
+                }
+                final String fUrl = apkUrl;
+
+                runOnUiThread(() -> {
+                    setBusy(false);
+                    if (remote <= BuildConfig.VERSION_CODE) {
+                        status("✓ Up to date (build " + BuildConfig.VERSION_CODE + ").");
+                    } else if (fUrl == null) {
+                        status("Update " + tag + " found, but it has no APK asset.");
+                    } else {
+                        promptInstall(remote, fUrl);
+                    }
+                });
+            } catch (Exception e) {
+                final String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                runOnUiThread(() -> {
+                    setBusy(false);
+                    status("✗ Update check failed — " + msg);
+                });
+            }
+        });
+    }
+
+    private void promptInstall(int build, String url) {
+        new AlertDialog.Builder(this)
+                .setTitle("Update available")
+                .setMessage("Build " + build + " is available (you have build "
+                        + BuildConfig.VERSION_CODE + ").\n\nDownload and install now?")
+                .setPositiveButton("Update", (d, w) -> downloadAndInstall(url))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void downloadAndInstall(String url) {
+        setBusy(true);
+        status("Downloading update …");
+        executor.submit(() -> {
+            try {
+                File dir = new File(getCacheDir(), "updates");
+                if (!dir.exists() && !dir.mkdirs()) throw new Exception("cannot create cache dir");
+                File apk = new File(dir, "update.apk");
+
+                HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+                conn.setRequestProperty("User-Agent", "fileupload-app");
+                conn.setInstanceFollowRedirects(true);
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(60000);
+                int code = conn.getResponseCode();
+                if (code != 200) throw new Exception("download HTTP " + code);
+
+                long total = conn.getContentLengthLong();
+                try (InputStream in = conn.getInputStream();
+                     OutputStream out = new FileOutputStream(apk)) {
+                    byte[] buf = new byte[1 << 16];
+                    long got = 0;
+                    int n;
+                    while ((n = in.read(buf)) >= 0) {
+                        out.write(buf, 0, n);
+                        got += n;
+                        if (total > 0) {
+                            int pct = (int) (got * 100 / total);
+                            runOnUiThread(() -> setProgressPct(pct));
+                        }
+                    }
+                } finally {
+                    conn.disconnect();
+                }
+
+                runOnUiThread(() -> {
+                    setBusy(false);
+                    status("Launching installer …");
+                    launchInstaller(apk);
+                });
+            } catch (Exception e) {
+                final String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                runOnUiThread(() -> {
+                    setBusy(false);
+                    status("✗ Download failed — " + msg);
+                });
+            }
+        });
+    }
+
+    private void launchInstaller(File apk) {
+        try {
+            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", apk);
+            Intent i = new Intent(Intent.ACTION_VIEW);
+            i.setDataAndType(uri, "application/vnd.android.package-archive");
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Exception e) {
+            status("✗ Could not open installer — " + e.getMessage());
+        }
+    }
+
+    /** Pull the integer build number out of a tag like "v123". */
+    private static int parseBuild(String tag) {
+        String digits = tag.replaceAll("[^0-9]", "");
+        if (digits.isEmpty()) return -1;
+        try {
+            return Integer.parseInt(digits);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private static String readAll(InputStream in) throws Exception {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) >= 0) bos.write(buf, 0, n);
+        return new String(bos.toByteArray(), StandardCharsets.UTF_8);
+    }
+
     // --- UI helpers ---
 
     private void setBusy(boolean busy) {
@@ -236,6 +411,7 @@ public class MainActivity extends AppCompatActivity {
         if (busy) progressBar.setProgress(0);
         findViewById(R.id.upload).setEnabled(!busy);
         findViewById(R.id.pick).setEnabled(!busy);
+        findViewById(R.id.update).setEnabled(!busy);
     }
 
     private void setProgressPct(int pct) {

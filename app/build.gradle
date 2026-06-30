@@ -6,12 +6,20 @@ android {
     namespace 'com.example.fileupload'
     compileSdk 34
 
+    // CI passes -PversionCode / -PversionName; locals fall back to 1 / "dev".
+    def ciVersionCode = (project.findProperty('versionCode') ?: '1').toString().toInteger()
+    def ciVersionName = (project.findProperty('versionName') ?: 'dev').toString()
+
     defaultConfig {
         applicationId "com.example.fileupload"
         minSdk 24
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        versionCode ciVersionCode
+        versionName ciVersionName
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     compileOptions {
