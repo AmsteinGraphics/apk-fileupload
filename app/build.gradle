@@ -22,6 +22,19 @@ android {
         buildConfig true
     }
 
+    // Fixed signing key committed to the repo so every build (local and CI)
+    // produces an identically-signed APK. This is required for the in-app
+    // OTA updates to install over an existing copy. Debug-grade security
+    // (like Android's well-known debug key) — fine for this personal tool.
+    signingConfigs {
+        upload {
+            storeFile file('upload.jks')
+            storePassword 'amsteinota'
+            keyAlias 'upload'
+            keyPassword 'amsteinota'
+        }
+    }
+
     compileOptions {
         coreLibraryDesugaringEnabled true
         sourceCompatibility JavaVersion.VERSION_17
@@ -29,8 +42,12 @@ android {
     }
 
     buildTypes {
+        debug {
+            signingConfig signingConfigs.upload
+        }
         release {
             minifyEnabled false
+            signingConfig signingConfigs.upload
         }
     }
 
